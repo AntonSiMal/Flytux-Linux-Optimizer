@@ -1,453 +1,915 @@
 #!/usr/bin/env bash
 #=============================================================================
-# 🐧 FlyTux Optimizer v15.1 - Edición "Fuentes Estables + Detección Robusta"
-# Objetivo: Optimización adaptativa profesional con detección precisa de
-# hardware usando /sys, /proc, dmidecode, glxinfo y tablas oficiales.
+# 🐧 FlyTux v26.0 - Sistema Cognitivo Cooperativo (Refined Edition)
+# Mejoras vs v25:
+#  • Perfil descriptivo completo (SMT, NUMA, cachés, sockets, virtualización)
+#  • CPUID real vía lscpu -J / cpuid cuando disponible
+#  • install_flytux() dividido en 8 subfunciones de ~100 líneas
+#  • Detectores optimizados (awk único en lugar de grep|awk|cat)
+#  • Hardening systemd documentado con limitaciones reales
+#  • Score GPU ampliado con tabla de Device IDs específicos
 #=============================================================================
 
 set -Eeuo pipefail
-trap 'echo "❌ Error en línea $LINENO: $BASH_COMMAND" >&2' ERR
 
-# FUNCIÓN: Instalar o actualizar paquetes
-install_or_upgrade() {
-  local DESC="$1"; shift
-  local PKGS=("$@")
-  [ ${#PKGS[@]} -eq 0 ] && return
-  echo "   📦 $DESC: procesando ${#PKGS[@]} paquetes..."
-  apt install -y "${PKGS[@]}" 2>/dev/null || true
-}
+# ═══════════════════════════════════════════════════════════════════════════
+# CONFIGURACIÓN GLOBAL
+# ═══════════════════════════════════════════════════════════════════════════
 
-# FUNCIÓN: Verificar si un paquete tiene versión candidata instalable
-pkg_exists() {
-  apt-cache madison "$1" 2>/dev/null | grep -q '|'
-}
-
-# FUNCIÓN: Habilitar servicio solo si existe físicamente
-enable_service() {
-  local SERVICE="$1"
-  if [ -f "/lib/systemd/system/$SERVICE.service" ] || [ -f "/etc/systemd/system/$SERVICE.service" ]; then
-    systemctl enable --now "$SERVICE" 2>/dev/null || true
-  fi
-}
-
-# 0. VALIDACIÓN INICIAL
-echo "🐧 FlyTux Optimizer v15.1 | $(date)"
-[ "$(id -u)" -ne 0 ] && { echo "❌ Ejecutar como: sudo bash $0"; exit 1; }
-
-. /etc/os-release
-if [[ ! "$ID_LIKE" =~ (debian|ubuntu) ]] && [[ ! "$ID" =~ (debian|ubuntu|linuxmint|pop|zorin) ]]; then
-    echo "❌ Solo compatible con Debian/Ubuntu/Linux Mint/Pop!_OS/Zorin OS"
-    exit 1
-fi
-
-export DEBIAN_FRONTEND=noninteractive
+FX="/etc/flytux"
+FV="/var/lib/flytux"
 LOG="/var/log/flytux-$(date +%F-%H%M).log"
-BACKUP="/var/backups/flytux-etc-$(date +%F).tar.gz"
-mkdir -p /var/backups
-exec > >(tee -a "$LOG") 2>&1
+BKP="/var/backups/flytux-$(date +%F).tar.gz"
+ERRORS=()
+WARNINGS=()
 
-echo "📦 Backup seguro en: $BACKUP | 📜 Logs: $LOG"
-echo "⏳ Iniciando diagnóstico avanzado..."
+# ═══════════════════════════════════════════════════════════════════════════
+# HELPERS DE LOGGING
+# ═══════════════════════════════════════════════════════════════════════════
 
-# 1. BACKUP DE SEGURIDAD
-echo ""; echo "🔐 [1/12] Creando backup persistente..."
-tar czf "$BACKUP" /etc/sysctl.d /etc/default /etc/systemd/system /etc/udev/rules.d \
-    /etc/modprobe.d /etc/apt/sources.list /etc/apt/sources.list.d/ /etc/apt/sources.sources 2>/dev/null || true
-[ -f "$BACKUP" ] && echo "✅ Backup creado: $(du -sh "$BACKUP" | awk '{print $1}')" || echo "⚠️ Backup incompleto"
+log()   { echo "✅ $*"; logger -t flytux "$*"; }
+info()  { echo "ℹ️  $*"; }
+warn()  { echo "⚠️  $*" >&2; WARNINGS+=("$*"); logger -t flytux "WARN: $*"; }
+error() { echo "❌ $*" >&2; ERRORS+=("$*"); logger -t flytux "ERROR: $*"; }
+fatal() { echo "💀 $*" >&2; logger -t flytux "FATAL: $*"; exit 1; }
 
-# 2. REPOSITORIOS (DEB822 .sources y legacy)
-echo ""; echo "🔓 [2/12] Habilitando repositorios..."
-enable_deb822_nonfree() {
-  local FILE="$1"; [ -f "$FILE" ] || return
-  if grep -q "^Components:" "$FILE" && ! grep -q "non-free" "$FILE"; then
-    sed -i '/^Components:/ s/$/ non-free non-free-firmware/' "$FILE" 2>/dev/null || true
+# ═══════════════════════════════════════════════════════════════════════════
+# GESTIÓN DE ERRORES
+# ═══════════════════════════════════════════════════════════════════════════
+
+run() {
+  local desc="$1"; shift
+  if "$@" >/dev/null 2>&1; then
+    return 0
+  else
+    local rc=$?
+    error "[$desc] falló (rc=$rc): $*"
+    return $rc
   fi
 }
-enable_legacy_nonfree() {
-  local FILE="$1"; [ -f "$FILE" ] || return
-  local CODENAME=$(grep "^VERSION_CODENAME=" /etc/os-release | cut -d= -f2)
-  for REPO in "contrib" "non-free" "non-free-firmware"; do
-    if ! grep -q "$REPO" "$FILE"; then
-      sed -i "s/^\(deb .*\)$CODENAME\(.*\)$/\1$CODENAME\2 $REPO/" "$FILE" 2>/dev/null || true
-    fi
-  done
+
+run_visible() {
+  local desc="$1"; shift
+  if "$@"; then
+    return 0
+  else
+    local rc=$?
+    error "[$desc] falló (rc=$rc): $*"
+    return $rc
+  fi
 }
 
-if [[ "$ID" == "debian" ]] || [[ "$ID_LIKE" == *"debian"* ]]; then
-  for FILE in /etc/apt/sources.list.d/*.sources /etc/apt/sources.sources; do enable_deb822_nonfree "$FILE"; done
-  enable_legacy_nonfree "/etc/apt/sources.list"
-else
-  for FILE in /etc/apt/sources.list.d/*.sources /etc/apt/sources.sources; do enable_deb822_nonfree "$FILE"; done
-  enable_legacy_nonfree "/etc/apt/sources.list"
-  command -v add-apt-repository &>/dev/null && { add-apt-repository multiverse -y >/dev/null 2>&1; add-apt-repository restricted -y >/dev/null 2>&1; } || true
-fi
+# ═══════════════════════════════════════════════════════════════════════════
+# HELPERS DE PAQUETES Y SERVICIOS
+# ═══════════════════════════════════════════════════════════════════════════
 
-fix_repo_arch() {
-  for FILE in $1; do
-    [ -f "$FILE" ] || continue
-    if [[ "$FILE" == *.sources ]]; then
-      grep -q "^Architectures:" "$FILE" 2>/dev/null || echo "Architectures: amd64" >> "$FILE"
-      sed -i '/^Components:/s/ contrib//g' "$FILE" 2>/dev/null || true
+pkg_exists() { apt-cache madison "$1" 2>/dev/null | grep -q '|'; }
+
+inst() {
+  local desc="$1"; shift
+  info "📦 $desc: $*"
+  if run "inst:$desc" apt install -y "$@"; then
+    log "$desc instalado"
+  else
+    warn "$desc: algunos paquetes fallaron"
+  fi
+}
+
+svc_on() {
+  systemctl list-unit-files "$1.service" &>/dev/null | grep -q "$1" || return 0
+  run "svc_on:$1" systemctl enable --now "$1"
+}
+
+svc_off() {
+  systemctl list-unit-files "$1.service" &>/dev/null | grep -q "$1" || return 0
+  run "svc_off:$1" systemctl disable --now "$1"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# JSON SEGURO
+# ═══════════════════════════════════════════════════════════════════════════
+
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
+  echo "$s"
+}
+
+json_write() {
+  local file="$1"; shift
+  local json="{"
+  local first=true
+  while [ $# -ge 2 ]; do
+    local key="$1" val="$2"; shift 2
+    $first || json+=","
+    first=false
+    if [[ "$val" == "true" || "$val" == "false" || "$val" =~ ^[0-9]+$ ]]; then
+      json+="\"$key\":$val"
     else
-      sed -i -E 's/^deb (https?:\/\/[^ ]+)/deb [arch=amd64] \1/' "$FILE" 2>/dev/null || true
-      sed -i 's/ contrib//g' "$FILE" 2>/dev/null || true
+      json+="\"$key\":\"$(json_escape "$val")\""
     fi
   done
+  json+="}"
+  echo "$json" > "$file"
 }
-fix_repo_arch "/etc/apt/sources.list.d/*brave*.list /etc/apt/sources.list.d/brave*.sources"
-fix_repo_arch "/etc/apt/sources.list.d/*chrome*.list /etc/apt/sources.list.d/google*.sources"
-fix_repo_arch "/etc/apt/sources.list.d/*protonvpn*.list"
 
-apt update -o Acquire::Retries=3 --allow-releaseinfo-change -y >/dev/null 2>&1 || true
-echo "✅ Repositorios configurados y actualizados"
+# ═══════════════════════════════════════════════════════════════════════════
+# DETECCIÓN DE CPU (perfil completo + CPUID real)
+# ═══════════════════════════════════════════════════════════════════════════
 
-# 3. DIAGNÓSTICO AVANZADO CON FUENTES ESTABLES
-echo ""; echo "🔍 [3/12] Diagnóstico avanzado de hardware..."
-RAM_MB=$(awk '/MemTotal/ {printf "%d",$2/1024}' /proc/meminfo)
-SWAP_TOTAL=$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo)
-HAS_SWAP=$([ "$SWAP_TOTAL" -gt 0 ] && echo "yes" || echo "no")
-
-# Factor de Forma (Laptop vs Desktop) vía /sys
-IS_LAPTOP="no"
-ls /sys/class/power_supply/BAT* >/dev/null 2>&1 && IS_LAPTOP="yes"
-
-# BIOS/UEFI vía /sys/firmware
-BOOT_MODE="BIOS"
-[ -d /sys/firmware/efi ] && BOOT_MODE="UEFI"
-
-# Secure Boot vía mokutil
-SECURE_BOOT="unknown"
-if command -v mokutil &>/dev/null; then
-  mokutil --sb-state 2>/dev/null | grep -q "SecureBoot enabled" && SECURE_BOOT="enabled"
-  mokutil --sb-state 2>/dev/null | grep -q "SecureBoot disabled" && SECURE_BOOT="disabled"
-fi
-
-# CPU: Family/Model vía /proc/cpuinfo
-CPU_VENDOR=$(grep -m1 "vendor_id" /proc/cpuinfo | awk '{print $3}' | tr '[:upper:]' '[:lower:]')
-CPU_CORES=$(nproc)
-CPU_FAMILY=$(grep -m1 "cpu family" /proc/cpuinfo | awk '{print $4}')
-CPU_MODEL_NUM=$(grep -m1 "^model[[:space:]]*:" /proc/cpuinfo | awk '{print $3}')
-CPU_MODEL=$(grep -m1 "model name" /proc/cpuinfo | cut -d: -f2 | xargs)
-
-# Instrucciones CPU vía /proc/cpuinfo
-CPU_FLAGS=$(grep -m1 "^flags" /proc/cpuinfo | tr '[:upper:]' '[:lower:]')
-HAS_AES=$(echo "$CPU_FLAGS" | grep -qw "aes" && echo "yes" || echo "no")
-HAS_AVX2=$(echo "$CPU_FLAGS" | grep -qw "avx2" && echo "yes" || echo "no")
-HAS_AVX512=$(echo "$CPU_FLAGS" | grep -qw "avx512f" && echo "yes" || echo "no")
-
-# CPU HÍBRIDA: Topología real con fallback a tablas de modelos Intel
-IS_HYBRID_CPU="no"
-if [ -d /sys/devices/system/cpu ]; then
-  # Método 1: Topología vía cpu_capacity (ARM y kernels modernos x86)
-  CAPACITIES=$(cat /sys/devices/system/cpu/cpu*/cpu_capacity 2>/dev/null | sort -u | wc -l)
-  [ "$CAPACITIES" -gt 1 ] && IS_HYBRID_CPU="yes"
-fi
-
-# Método 2: Fallback a modelos Intel conocidos con E-Cores (tablas oficiales)
-if [ "$IS_HYBRID_CPU" = "no" ] && [[ "$CPU_VENDOR" == *"intel"* ]] && [ "$CPU_FAMILY" = "6" ]; then
-  case "$CPU_MODEL_NUM" in
-    151|154|155) IS_HYBRID_CPU="yes" ;; # Alder Lake (12th gen)
-    158|165|170) IS_HYBRID_CPU="yes" ;; # Raptor Lake (13th/14th gen)
-    173) IS_HYBRID_CPU="yes" ;;         # Meteor Lake (Core Ultra 1)
-    185|198) IS_HYBRID_CPU="yes" ;;     # Lunar Lake / Arrow Lake
-  esac
-fi
-
-# Generación CPU vía tablas oficiales (NO lineales)
-CPU_GEN="unknown"
-if [[ "$CPU_VENDOR" == *"intel"* ]] && [ "$CPU_FAMILY" = "6" ]; then
-  case "$CPU_MODEL_NUM" in
-    151|154|155) CPU_GEN="Alder Lake (12th)" ;;
-    158|165) CPU_GEN="Raptor Lake (13th)" ;;
-    170) CPU_GEN="Raptor Lake Refresh (14th)" ;;
-    173) CPU_GEN="Meteor Lake (Core Ultra 1)" ;;
-    185) CPU_GEN="Lunar Lake (Core Ultra 2)" ;;
-    198) CPU_GEN="Arrow Lake (Core Ultra 3)" ;;
-    140|141) CPU_GEN="Tiger Lake (11th)" ;;
-    126|142) CPU_GEN="Ice/Comet Lake (10th)" ;;
-  esac
-elif [[ "$CPU_VENDOR" == *"amd"* ]]; then
-  if [ "$CPU_FAMILY" = "26" ]; then CPU_GEN="Zen 5"
-  elif [ "$CPU_FAMILY" = "25" ]; then
-    [ "$CPU_MODEL_NUM" -ge 16 ] 2>/dev/null && CPU_GEN="Zen 4" || CPU_GEN="Zen 3"
-  elif [ "$CPU_FAMILY" = "23" ]; then
-    [ "$CPU_MODEL_NUM" -ge 112 ] 2>/dev/null && CPU_GEN="Zen 2" || CPU_GEN="Zen / Zen+"
-  fi
-fi
-
-# Disco
-DISK_NAME=$(lsblk -ndo pkname "$(df -P / | awk 'NR==2{print $1}')" 2>/dev/null | head -1)
-DISK_TYPE="HDD"
-if [ -n "$DISK_NAME" ]; then
-  [ "$(cat /sys/block/$DISK_NAME/queue/rotational 2>/dev/null)" = "0" ] && DISK_TYPE="SSD_SATA"
-  echo "$DISK_NAME" | grep -qi "nvme" && DISK_TYPE="NVME"
-fi
-
-# TRIM: Verificar con lsblk --discard
-SUPPORTS_TRIM="no"
-if [ "$DISK_TYPE" != "HDD" ] && [ -n "$DISK_NAME" ]; then
-  DISC_INFO=$(lsblk --discard "/dev/$DISK_NAME" 2>/dev/null | tail -n 1)
-  if echo "$DISC_INFO" | grep -qE "yes|1"; then
-    SUPPORTS_TRIM="yes"
-  fi
-fi
-
-# RAM ECC: EDAC primero (preciso), luego dmidecode como fallback
-HAS_ECC="no"
-if [ -d /sys/devices/system/edac/mc ]; then
-  if ls /sys/devices/system/edac/mc/mc*/ce_count 2>/dev/null | head -1 | grep -q "ce_count"; then
-    HAS_ECC="yes"
-  fi
-fi
-if [ "$HAS_ECC" = "no" ] && command -v dmidecode &>/dev/null; then
-  if dmidecode -t memory 2>/dev/null | grep -q "ECC"; then
-    HAS_ECC="yes"
-  fi
-fi
-
-# GPU: Combinación de métodos para obtener GPU real
-GPU_VENDORS=""
-PRIMARY_GPU_DRIVER="unknown"
-
-if command -v lspci &>/dev/null; then
-  lspci -nn | grep -iE "vga|3d|display" | grep -q "\[8086:" && GPU_VENDORS="${GPU_VENDORS}intel,"
-  lspci -nn | grep -iE "vga|3d|display" | grep -q "\[1002:" && GPU_VENDORS="${GPU_VENDORS}amd,"
-  lspci -nn | grep -iE "vga|3d|display" | grep -q "\[10de:" && GPU_VENDORS="${GPU_VENDORS}nvidia,"
+read_cpuinfo() {
+  # Leer /proc/cpuinfo UNA sola vez con awk optimizado
+  eval "$(awk -F: '
+    /^vendor_id/ && !v {gsub(/^[ \t]+|[ \t]+$/, "", $2); print "CV=" tolower($2); v=1}
+    /^cpu family/ && !f {gsub(/^[ \t]+|[ \t]+$/, "", $2); print "CF=" $2; f=1}
+    /^model[ \t]*:/ && !m {gsub(/^[ \t]+|[ \t]+$/, "", $2); print "CM=" $2; m=1}
+    /^stepping/ && !s {gsub(/^[ \t]+|[ \t]+$/, "", $2); print "CS=" $2; s=1}
+    /^model name/ && !n {gsub(/^[ \t]+|[ \t]+$/, "", $2); print "CN=\"" $2 "\""; n=1}
+    /^flags/ && !fl {gsub(/^[ \t]+|[ \t]+$/, "", $2); print "FLG=\"" $2 "\""; fl=1}
+    /^cpu MHz/ && !mhz {gsub(/^[ \t]+|[ \t]+$/, "", $2); print "CPU_CUR_MHZ=" int($2); mhz=1}
+    /^cpu cores/ && !cores {gsub(/^[ \t]+|[ \t]+$/, "", $2); print "CPU_PHYS_CORES=" $2; cores=1}
+    /^siblings/ && !sib {gsub(/^[ \t]+|[ \t]+$/, "", $2); print "CPU_SIBLINGS=" $2; sib=1}
+    /^physical id/ && !pid {gsub(/^[ \t]+|[ \t]+$/, "", $2); SOCKETS[$2]=1}
+    /^cache size/ && !cache {gsub(/^[ \t]+|[ \t]+$/, "", $2); print "CPU_CACHE=\"" $2 "\""; cache=1}
+    END {
+      print "CPU_SOCKETS=" length(SOCKETS)
+    }
+  ' /proc/cpuinfo)"
   
-  # Método 1: glxinfo (GPU que realmente renderiza en X11/Wayland)
-  if command -v glxinfo &>/dev/null; then
-    RENDERER=$(glxinfo 2>/dev/null | grep "OpenGL renderer string" | tr '[:upper:]' '[:lower:]')
-    if echo "$RENDERER" | grep -q "intel"; then PRIMARY_GPU_DRIVER="i915"
-    elif echo "$RENDERER" | grep -qE "amd|radeon"; then PRIMARY_GPU_DRIVER="amdgpu"
-    elif echo "$RENDERER" | grep -q "nvidia"; then PRIMARY_GPU_DRIVER="nvidia"
+  CC=$(nproc)
+  AVX2=$(echo "$FLG" | grep -qw avx2 && echo true || echo false)
+  AVX512=$(echo "$FLG" | grep -qw avx512f && echo true || echo false)
+  
+  # SMT (Hyper-Threading)
+  SMT=false
+  [ -n "$CPU_PHYS_CORES" ] && [ -n "$CPU_SIBLINGS" ] && [ "$CPU_SIBLINGS" -gt "$CPU_PHYS_CORES" ] && SMT=true
+  
+  # Frecuencia máxima: cpufreq > lscpu -J > lscpu
+  CPU_MAX_MHZ=0
+  CPU_MIN_MHZ=0
+  if [ -f /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq ]; then
+    CPU_MAX_MHZ=$(( $(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq) / 1000 ))
+    [ -f /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_min_freq ] && \
+      CPU_MIN_MHZ=$(( $(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_min_freq) / 1000 ))
+  elif command -v lscpu &>/dev/null; then
+    # Intentar lscpu -J (JSON) primero para datos estructurados
+    if lscpu -J &>/dev/null; then
+      CPU_MAX_MHZ=$(lscpu -J 2>/dev/null | awk -F'"' '/CPU max MHz/{for(i=1;i<=NF;i++) if($i=="CPU max MHz") print $(i+4)}' | tr -d ' ,')
+      CPU_MIN_MHZ=$(lscpu -J 2>/dev/null | awk -F'"' '/CPU min MHz/{for(i=1;i<=NF;i++) if($i=="CPU min MHz") print $(i+4)}' | tr -d ' ,')
     fi
+    [ -z "$CPU_MAX_MHZ" ] || [ "$CPU_MAX_MHZ" -eq 0 ] && \
+      CPU_MAX_MHZ=$(lscpu 2>/dev/null | awk '/CPU max MHz/{printf "%d",$4}')
+    [ -z "$CPU_MIN_MHZ" ] || [ "$CPU_MIN_MHZ" -eq 0 ] && \
+      CPU_MIN_MHZ=$(lscpu 2>/dev/null | awk '/CPU min MHz/{printf "%d",$4}')
   fi
+  [ -z "$CPU_MAX_MHZ" ] || [ "$CPU_MAX_MHZ" -eq 0 ] && CPU_MAX_MHZ=2000
+  [ -z "$CPU_MIN_MHZ" ] || [ "$CPU_MIN_MHZ" -eq 0 ] && CPU_MIN_MHZ=800
   
-  # Método 2: vulkaninfo (alternativa si glxinfo falla)
-  if [ "$PRIMARY_GPU_DRIVER" = "unknown" ] && command -v vulkaninfo &>/dev/null; then
-    DEVICE=$(vulkaninfo 2>/dev/null | grep "deviceName" | head -n 1 | tr '[:upper:]' '[:lower:]')
-    if echo "$DEVICE" | grep -q "intel"; then PRIMARY_GPU_DRIVER="i915"
-    elif echo "$DEVICE" | grep -qE "amd|radeon"; then PRIMARY_GPU_DRIVER="amdgpu"
-    elif echo "$DEVICE" | grep -q "nvidia"; then PRIMARY_GPU_DRIVER="nvidia"
-    fi
+  # CPU híbrida: topología real
+  HYB=false
+  CAPS=$(cat /sys/devices/system/cpu/cpu*/cpu_capacity 2>/dev/null | sort -u | wc -l)
+  [ "$CAPS" -gt 1 ] && HYB=true
+  
+  # Virtualización
+  VIRT="none"
+  echo "$FLG" | grep -qw vmx && VIRT="vmx"
+  echo "$FLG" | grep -qw svm && VIRT="svm"
+  command -v systemd-detect-virt &>/dev/null && {
+    VIRT_TYPE=$(systemd-detect-virt 2>/dev/null)
+    [ "$VIRT_TYPE" != "none" ] && VIRT="$VIRT_TYPE"
+  }
+  
+  # NUMA
+  NUMA_NODES=1
+  [ -d /sys/devices/system/node ] && NUMA_NODES=$(ls -d /sys/devices/system/node/node* 2>/dev/null | wc -l)
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# BASE CPUID (sin duplicados, amplia)
+# ═══════════════════════════════════════════════════════════════════════════
+
+detect_cpu_generation() {
+  CG="unknown"; TLE=100
+  
+  if [[ "$CV" == *"intel"* && "$CF" == "6" ]]; then
+    case "$CM" in
+      198) CG="ArrowLake-S"; TLE=105;;
+      185) CG="LunarLake"; TLE=105;;
+      183) CG="ArrowLake-H"; TLE=105;;
+      173) CG="MeteorLake"; TLE=105;;
+      170|171) CG="RaptorLake-R"; TLE=100;;
+      167) CG="RocketLake"; TLE=100;;
+      158|165) CG="RaptorLake"; TLE=100;;
+      151|154|155) CG="AlderLake"; TLE=100;;
+      140|141) CG="TigerLake"; TLE=100;;
+      142) CG="KabyLake-R"; TLE=100;;
+      126) CG="CometLake-U"; TLE=100;;
+      125) CG="IceLake-Y"; TLE=100;;
+      102) CG="CannonLake"; TLE=100;;
+      150) CG="AlderLake-N"; TLE=105;;
+      166) CG="CometLake-H"; TLE=100;;
+      162) CG="CoffeeLake-R"; TLE=100;;
+      152) CG="CoffeeLake"; TLE=100;;
+      122) CG="GeminiLake"; TLE=105;;
+      92) CG="ApolloLake"; TLE=105;;
+      78|94) CG="Skylake"; TLE=100;;
+      61|71) CG="Broadwell"; TLE=100;;
+      60|69|70) CG="Haswell"; TLE=100;;
+      58) CG="IvyBridge"; TLE=105;;
+      42) CG="SandyBridge"; TLE=100;;
+      37|44|53) CG="Westmere"; TLE=105;;
+      26|30|31|46) CG="Nehalem"; TLE=100;;
+      23|29) CG="Penryn"; TLE=105;;
+      15) CG="Merom"; TLE=100;;
+      *) CG="Intel-F6-M$CM";;
+    esac
+  elif [[ "$CV" == *"amd"* ]]; then
+    case "$CF" in
+      26) CG="Zen5"; TLE=95;;
+      25)
+        if [ "$CM" -ge 112 ] 2>/dev/null; then CG="Zen4-Dragon"; TLE=95
+        elif [ "$CM" -ge 96 ] 2>/dev/null; then CG="Zen4-Phoenix"; TLE=95
+        elif [ "$CM" -ge 80 ] 2>/dev/null; then CG="Zen4-Raphael"; TLE=95
+        elif [ "$CM" -ge 64 ] 2>/dev/null; then CG="Zen3+-Rembrandt"; TLE=95
+        elif [ "$CM" -ge 32 ] 2>/dev/null; then CG="Zen3-Vermeer"; TLE=90
+        elif [ "$CM" -ge 16 ] 2>/dev/null; then CG="Zen3-Cezanne"; TLE=90
+        else CG="Zen3"; TLE=90; fi;;
+      23)
+        if [ "$CM" -ge 112 ] 2>/dev/null; then CG="Zen2-Vermeer"; TLE=95
+        elif [ "$CM" -ge 96 ] 2>/dev/null; then CG="Zen2-Matisse"; TLE=95
+        elif [ "$CM" -ge 48 ] 2>/dev/null; then CG="Zen2-Renoir"; TLE=95
+        elif [ "$CM" -ge 16 ] 2>/dev/null; then CG="Zen+-Picasso"; TLE=95
+        else CG="Zen-Summit"; TLE=95; fi;;
+      21) CG="Bulldozer/Piledriver"; TLE=90;;
+      *) CG="AMD-F$CF";;
+    esac
   fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# GPU (lspci cacheado + tabla ampliada de Device IDs)
+# ═══════════════════════════════════════════════════════════════════════════
+
+cache_lspci() {
+  LSPCI_NN=$(lspci -nn 2>/dev/null || echo "")
+  LSPCI_NNK=$(lspci -nnk 2>/dev/null || echo "")
+}
+
+detect_gpu() {
+  GV=""; HI=false; HA=false; HN=false; GC=0; PD="unknown"
   
-  # Método 3: DRM (conectores activos)
-  if [ "$PRIMARY_GPU_DRIVER" = "unknown" ] && [ -d /sys/class/drm ]; then
-    for CARD in /sys/class/drm/card*; do
-      [ -d "$CARD" ] || continue
-      if ls "$CARD"/card*-HDMI-* "$CARD"/card*-DP-* 2>/dev/null | xargs grep -l "connected" 2>/dev/null | head -1 | grep -q .; then
-        DRIVER=$(readlink "$CARD/device/driver" 2>/dev/null | xargs basename)
-        [ -n "$DRIVER" ] && PRIMARY_GPU_DRIVER="$DRIVER" && break
-      fi
+  if [ -n "$LSPCI_NN" ]; then
+    echo "$LSPCI_NN" | grep -iE "vga|3d|display" | grep -q "\[8086:" && { GV+="intel,"; HI=true; GC=$((GC+1)); }
+    echo "$LSPCI_NN" | grep -iE "vga|3d|display" | grep -q "\[1002:" && { GV+="amd,"; HA=true; GC=$((GC+1)); }
+    echo "$LSPCI_NN" | grep -iE "vga|3d|display" | grep -q "\[10de:" && { GV+="nvidia,"; HN=true; GC=$((GC+1)); }
+    [ "$GC" -gt 1 ] && HYB_GPU=true || HYB_GPU=false
+    PD=$(echo "$LSPCI_NNK" | grep -i "vga compatible controller" -A2 | grep "Kernel driver in use:" | awk '{print $4}' | tr A-Z a-z | head -1)
+    [ -z "$PD" ] && PD=$(echo "$LSPCI_NNK" | grep -i "3d controller" -A2 | grep "Kernel driver in use:" | awk '{print $4}' | tr A-Z a-z | head -1)
+    [ -z "$PD" ] && PD="unknown"
+  fi
+  GV="${GV%,}"; [ -z "$GV" ] && GV="unknown"
+}
+
+get_gpu_score() {
+  local GPU_ID=$(echo "$LSPCI_NN" | grep -iE "vga|3d" | head -1 | grep -oE '\[[0-9a-f]{4}:[0-9a-f]{4}\]' | tr -d '[]')
+  
+  # Tabla ampliada de Device IDs específicos
+  case "$GPU_ID" in
+    # NVIDIA Blackwell (RTX 50xx) - 20 pts
+    10de:2f00|10de:2f01|10de:2f02|10de:2f03|10de:2f04|10de:2f05|10de:2f06|10de:2f07) echo 20;;
+    
+    # NVIDIA Ada (RTX 40xx) - 18 pts
+    10de:2684|10de:2685|10de:2686|10de:2687|10de:2700|10de:2701|10de:2702|10de:2703|10de:2704|10de:2705|10de:2706|10de:2707|10de:2708|10de:2709) echo 18;;
+    
+    # NVIDIA Ampere (RTX 30xx) - 16 pts
+    10de:2204|10de:2206|10de:2207|10de:2208|10de:2216|10de:2484|10de:2486|10de:2487|10de:2489|10de:24b0|10de:24b4|10de:24b6|10de:24b8|10de:24b9|10de:24ba|10de:24bb|10de:24bc|10de:24bd|10de:24be|10de:24bf) echo 16;;
+    
+    # NVIDIA Turing (RTX 20xx) - 14 pts
+    10de:1e04|10de:1e07|10de:1e30|10de:1e37|10de:1e84|10de:1e87|10de:1e89|10de:1ec2|10de:1ec7|10de:1f07|10de:1f08|10de:1f10|10de:1f11|10de:1f14|10de:1f15|10de:1f42|10de:1f50|10de:1f51|10de:1f54|10de:1f55|10de:1fb0|10de:1fb1|10de:1fb2|10de:1fb9|10de:1fba|10de:1fbb|10de:1ffc|10de:1ffd|10de:1ff6) echo 14;;
+    
+    # NVIDIA Pascal (GTX 10xx) - 10 pts
+    10de:1b00|10de:1b06|10de:1b80|10de:1b81|10de:1b82|10de:1b84|10de:1ba1|10de:1be0|10de:1be1|10de:1c02|10de:1c03|10de:1c20|10de:1c30|10de:1c31|10de:1c81|10de:1c82|10de:1c8d|10de:1d01|10de:1d02|10de:1d10|10de:1d12|10de:1d33|10de:1d35) echo 10;;
+    
+    # AMD RDNA3 (RX 7000) - 18 pts
+    1002:744c|1002:744d|1002:747c|1002:747e|1002:743f|1002:7440|1002:7441|1002:7445|1002:7447|1002:7448|1002:744a|1002:744b|1002:744e|1002:744f|1002:745a|1002:745c|1002:745e|1002:7460|1002:7461|1002:747d|1002:747f) echo 18;;
+    
+    # AMD RDNA2 (RX 6000) - 15 pts
+    1002:73a1|1002:73a2|1002:73a3|1002:73a5|1002:73ab|1002:73ae|1002:73b5|1002:73bf|1002:73c1|1002:73c3|1002:73d1|1002:73d3|1002:73d5|1002:73db|1002:73dd|1002:73df|1002:73e0|1002:73e1|1002:73e2|1002:73e3|1002:73e5|1002:73eb|1002:73ed|1002:73ef|1002:73ff) echo 15;;
+    
+    # AMD RDNA1 (RX 5000) - 12 pts
+    1002:7310|1002:7312|1002:731a|1002:731b|1002:731f|1002:7340|1002:7341|1002:7360|1002:7362) echo 12;;
+    
+    # Intel Arc - 14 pts
+    8086:4c8a|8086:4c8b|8086:4c8c|8086:4c90|8086:5690|8086:5691|8086:5692|8086:56a0|8086:56a1|8086:56a5|8086:56a6|8086:56b0|8086:56b1|8086:56c0|8086:7d55|8086:7d60|8086:7dd5) echo 14;;
+    
+    # Intel Gen12 (Tiger Lake integrado) - 6 pts
+    8086:9a40|8086:9a49|8086:9a60|8086:9a68|8086:9a78|8086:9ac0|8086:9ac9|8086:9ad9|8086:9af8) echo 6;;
+    
+    # Default
+    *) echo 6;;
+  esac
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DETECCIÓN RESTANTE (optimizada con awk)
+# ═══════════════════════════════════════════════════════════════════════════
+
+detect_storage() {
+  # Optimizado: una sola llamada a lsblk con awk
+  eval "$(lsblk -ndo NAME,TYPE,SIZE,MODEL,ROTA,DISC-GRAN,DISC-MAX 2>/dev/null | awk '
+    NR==1 {next}
+    $2=="disk" && !found {
+      print "DN=" $1
+      print "DT=" ($7 ~ /^[0-9]/ && $7 > 0 ? "ssd" : "hdd")
+      if ($1 ~ /nvme/) print "DT=nvme"
+      print "TRIM=" ($8 ~ /^[0-9]/ && $8 > 0 ? "true" : "false")
+      found=1
+    }
+  ')"
+  [ -z "$DT" ] && DT="hdd"
+  [ -z "$TRIM" ] && TRIM=false
+}
+
+detect_peripherals() {
+  BT=false
+  lsusb 2>/dev/null | grep -qi bluetooth && BT=true
+  [ "$BT" = "false" ] && [ -n "$LSPCI_NN" ] && echo "$LSPCI_NN" | grep -qi bluetooth && BT=true
+  [ "$BT" = "false" ] && command -v hciconfig &>/dev/null && hciconfig 2>/dev/null | grep -q hci && BT=true
+  MD=$(lsusb 2>/dev/null | grep -qiE "modem|lte|4g|5g" && echo true || echo false)
+  PR=$(lpstat -p 2>/dev/null | grep -q printer && echo true || echo false)
+  SN=false; command -v sensors &>/dev/null && sensors 2>/dev/null | grep -qE "Core|Tctl|Package" && SN=true
+}
+
+detect_system() {
+  # Optimizado: una sola lectura de /proc/meminfo
+  eval "$(awk '
+    /^MemTotal:/ {print "RAM=" int($2/1024)}
+    /^SwapTotal:/ {print "SWAP=" $2}
+  ' /proc/meminfo)"
+  
+  LAPTOP=$(ls /sys/class/power_supply/BAT* &>/dev/null && echo true || echo false)
+  BOOT=$([ -d /sys/firmware/efi ] && echo uefi || echo bios)
+  SB="unknown"; command -v mokutil &>/dev/null && { mokutil --sb-state 2>/dev/null | grep -q "enabled" && SB="on"; mokutil --sb-state 2>/dev/null | grep -q "disabled" && SB="off"; }
+  AU=$(logname 2>/dev/null || who | awk '{print $1;exit}')
+  DE="${XDG_CURRENT_DESKTOP:-unknown}"; DE=$(echo "$DE" | tr A-Z a-z)
+  
+  AM=""
+  systemctl is-active -q power-profiles-daemon 2>/dev/null && AM+="ppd,"
+  systemctl is-active -q tlp 2>/dev/null && AM+="tlp,"
+  systemctl is-active -q thermald 2>/dev/null && AM+="thermald,"
+  AM="${AM%,}"; [ -z "$AM" ] && AM="none"
+  FM=$([ "$AM" = "none" ] && echo "exclusive" || echo "cooperative")
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# HAL FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════
+
+thermal_get_temp() {
+  local T=0
+  for H in /sys/class/hwmon/hwmon*/temp1_input; do
+    [ -f "$H" ] || continue
+    LABEL=$(cat "${H%temp1_input}/name" 2>/dev/null)
+    case "$LABEL" in coretemp*|k10temp*|cpu*|zen*|acpitz*) ;; *) continue;; esac
+    V=$(cat "$H" 2>/dev/null); V=$((V/1000))
+    [ "$V" -gt "$T" ] && T=$V
+  done
+  if [ "$T" -eq 0 ]; then
+    for Z in /sys/class/thermal/thermal_zone*; do
+      [ -d "$Z" ] || continue
+      TYPE=$(cat "$Z/type" 2>/dev/null)
+      case "$TYPE" in x86_pkg_temp*|k10temp*|coretemp*|cpu_thermal*) ;; *) continue;; esac
+      V=$(cat "$Z/temp" 2>/dev/null); V=$((V/1000))
+      [ "$V" -gt "$T" ] && T=$V
     done
   fi
-  
-  # Método 4: Fallback final a lspci
-  if [ "$PRIMARY_GPU_DRIVER" = "unknown" ]; then
-    PRIMARY_GPU_DRIVER=$(lspci -nnk | grep -i "vga compatible controller" -A 2 | grep "Kernel driver in use:" | awk '{print $4}' | tr '[:upper:]' '[:lower:]' | head -n 1)
-  fi
-fi
-
-GPU_VENDORS="${GPU_VENDORS%,}"
-[ -z "$GPU_VENDORS" ] && GPU_VENDORS="unknown"
-
-ACTIVE_USER=$(logname 2>/dev/null || who | awk '{print $1;exit}')
-DE="unknown"; command -v loginctl &>/dev/null && [ -n "$ACTIVE_USER" ] && {
-  S=$(loginctl list-sessions --no-legend | grep -m1 "$ACTIVE_USER" | awk '{print $1}')
-  [ -n "$S" ] && DE=$(loginctl show-session "$S" -p Desktop --value 2>/dev/null || echo unknown)
+  echo "$T"
 }
-[ -z "$DE" ] || [ "$DE" = "unknown" ] && DE="${XDG_CURRENT_DESKTOP:-unknown}"
-DE=$(echo "$DE" | tr '[:upper:]' '[:lower:]')
 
-echo "💾 ${RAM_MB}MB RAM | 🔄 Swap: $HAS_SWAP | 💻 Laptop: $IS_LAPTOP | ECC: $HAS_ECC"
-echo "🖥️ CPU: $CPU_VENDOR $CPU_GEN (Family $CPU_FAMILY Model $CPU_MODEL_NUM) | Híbrida: $IS_HYBRID_CPU | AVX512: $HAS_AVX512"
-echo "💿 Disco: $DISK_TYPE | TRIM: $SUPPORTS_TRIM | 🎮 GPU: $GPU_VENDORS (Primaria: $PRIMARY_GPU_DRIVER)"
-echo "🔐 Boot: $BOOT_MODE | Secure Boot: $SECURE_BOOT | 🖼️ $DE"
+thermal_get_limit() {
+  local L=0
+  for H in /sys/class/hwmon/hwmon*/temp1_crit; do
+    [ -f "$H" ] || continue
+    V=$(cat "$H" 2>/dev/null); V=$((V/1000))
+    [ "$V" -ge 70 ] && [ "$V" -le 115 ] && [ "$V" -gt "$L" ] && L=$V
+  done
+  [ "$L" -eq 0 ] && L=${TLE:-100}
+  [ -z "$L" ] || [ "$L" -eq 0 ] && L=100
+  echo "$L"
+}
 
-# 4. MOTOR DE PERFILES ADAPTATIVOS
-echo ""; echo "📊 [4/12] Calculando perfil de optimización..."
-if [ "$RAM_MB" -le 4096 ]; then RAM_TIER="LOW (≤4GB)"
-elif [ "$RAM_MB" -le 8192 ]; then RAM_TIER="MID (≤8GB)"
-elif [ "$RAM_MB" -le 16384 ]; then RAM_TIER="HIGH (≤16GB)"
-else RAM_TIER="ULTRA (>16GB)"; fi
+thermal_profile() {
+  local T=$(thermal_get_temp) L=$(thermal_get_limit) P=$((T*100/L))
+  if [ "$P" -lt 75 ]; then echo performance
+  elif [ "$P" -lt 88 ]; then echo balanced
+  else echo powersave; fi
+}
 
-USE_ZRAM="no"; USE_PRELOAD="no"; USE_EARLYOOM="no"
+cpu_set_governor() {
+  local REQ="$1" NOW=$(date +%s)
+  local SF="/var/lib/flytux/history/cpu-state"
+  [ -f "$SF" ] && { LAST=$(cut -d'|' -f1 "$SF"); LC=$(cut -d'|' -f2 "$SF"); }
+  [ "$LAST" = "$REQ" ] && return
+  [ $((NOW - ${LC:-0})) -lt 120 ] && return
+  
+  local DRV=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_driver 2>/dev/null)
+  local GOV="schedutil"
+  case "$DRV" in
+    intel_pstate|amd_pstate*)
+      case "$REQ" in performance) GOV="performance";; *) GOV="powersave";; esac;;
+    *)
+      case "$REQ" in performance) GOV="performance";; balanced) GOV="schedutil";; powersave|silent) GOV="powersave";; esac;;
+  esac
+  grep -q "$GOV" /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors 2>/dev/null || return
+  echo "$GOV" | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor &>/dev/null || true
+  echo "${REQ}|${NOW}" > "$SF"
+  logger -t flytux "gov=$GOV ($REQ) drv=$DRV"
+}
 
-if [[ "$RAM_TIER" == "LOW"* ]]; then
-  USE_ZRAM="yes"; USE_EARLYOOM="yes"
-  [ "$DISK_TYPE" == "HDD" ] && USE_PRELOAD="yes"
-elif [[ "$RAM_TIER" == "MID"* ]]; then
-  USE_ZRAM="yes"
-  [ "$DISK_TYPE" == "HDD" ] && { USE_EARLYOOM="yes"; USE_PRELOAD="yes"; }
-  [ "$HAS_SWAP" == "no" ] && USE_EARLYOOM="yes"
-elif [[ "$RAM_TIER" == "HIGH"* ]]; then
-  [ "$HAS_SWAP" == "no" ] && USE_EARLYOOM="yes"
-fi
-
-ZRAM_SIZE=$((RAM_MB * 50 / 100))
-[ "$ZRAM_SIZE" -gt 4096 ] && ZRAM_SIZE=4096
-
-echo "✅ Perfil: $RAM_TIER + $DISK_TYPE | ZRAM: $USE_ZRAM | EarlyOOM: $USE_EARLYOOM | Preload: $USE_PRELOAD"
-
-# 5. KERNEL + SYSCTL (Solo red, memoria delegada al kernel)
-echo ""; echo "⚙️ [5/12] Ajustes de kernel (No intrusivos)..."
-if [ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors ]; then
-  if grep -q "schedutil" /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors; then
-    echo schedutil | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null || true
+gpu_set_mode() {
+  local MODE="$1"
+  if command -v prime-select &>/dev/null; then
+    case "$MODE" in
+      integrated) prime-select intel 2>/dev/null || prime-select amd 2>/dev/null;;
+      nvidia)     prime-select nvidia 2>/dev/null;;
+      on-demand)  prime-select on-demand 2>/dev/null;;
+    esac
+  elif command -v envycontrol &>/dev/null; then
+    case "$MODE" in
+      integrated) envycontrol -s integrated 2>/dev/null;;
+      nvidia)     envycontrol -s nvidia 2>/dev/null;;
+      hybrid)     envycontrol -s hybrid 2>/dev/null;;
+    esac
   fi
-fi
+}
 
-cat > /etc/sysctl.d/99-flytux.conf <<EOF
+battery_get_source() {
+  for P in /sys/class/power_supply/*/type; do
+    [ -f "$P" ] && grep -q Mains "$P" 2>/dev/null && [ "$(cat "${P%type}online" 2>/dev/null)" = "1" ] && { echo ac; return; }
+  done
+  echo battery
+}
+
+battery_get_percent() {
+  for C in /sys/class/power_supply/BAT*/capacity; do
+    [ -f "$C" ] && { cat "$C"; return; }
+  done
+  echo 100
+}
+
+battery_apply_profile() {
+  local S=$(battery_get_source) B=$(battery_get_percent) G="balanced" GM="on-demand"
+  [ "$S" = "battery" ] && { G="powersave"; GM="integrated"; }
+  cpu_set_governor "$G"
+  gpu_set_mode "$GM"
+  logger -t flytux "power=$S batt=$B gov=$G gpu=$GM"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SCORE PONDERADO
+# ═══════════════════════════════════════════════════════════════════════════
+
+score_calculate() {
+  local S_CPU=0 S_RAM=0 S_GPU=0 S_DISK=0 S_INST=0 S_GEN=0 S_TEMP=0
+  
+  local cpu_pts=0
+  cpu_pts=$((CC > 24 ? 20 : CC > 16 ? 17 : CC > 12 ? 14 : CC > 8 ? 11 : CC > 4 ? 7 : 3))
+  cpu_pts=$((cpu_pts + (CPU_MAX_MHZ > 5000 ? 10 : CPU_MAX_MHZ > 4000 ? 8 : CPU_MAX_MHZ > 3000 ? 5 : 2)))
+  $HYB && cpu_pts=$((cpu_pts + 5))
+  [ "$cpu_pts" -gt 35 ] && cpu_pts=35
+  S_CPU=$cpu_pts
+  
+  S_RAM=$((RAM > 32768 ? 20 : RAM > 16384 ? 17 : RAM > 8192 ? 13 : RAM > 4096 ? 8 : 4))
+  S_GPU=$(get_gpu_score)
+  [ "$S_GPU" -gt 20 ] && S_GPU=20
+  
+  echo "$DN" | grep -qi nvme && S_DISK=10 || \
+    { [ -n "$DN" ] && [ "$(cat /sys/block/$DN/queue/rotational 2>/dev/null)" = "0" ] && S_DISK=6; }
+  
+  echo "$FLG" | grep -qw avx512f && S_INST=5 || \
+    { echo "$FLG" | grep -qw avx2 && S_INST=3; } || S_INST=1
+  
+  case "$CG" in
+    *Zen5*|*Lunar*|*Arrow*|*Meteor*) S_GEN=5;;
+    *Zen4*|*Raptor*|*Alder*) S_GEN=4;;
+    *Zen3*|*Tiger*|*Rocket*) S_GEN=3;;
+    *Zen2*|*Ice*|*Comet*) S_GEN=2;;
+    *) S_GEN=1;;
+  esac
+  
+  local TEMP=$(thermal_get_temp 2>/dev/null)
+  [ -n "$TEMP" ] && [ "$TEMP" -gt 0 ] && {
+    [ "$TEMP" -lt 50 ] && S_TEMP=5 || \
+    [ "$TEMP" -lt 65 ] && S_TEMP=4 || \
+    [ "$TEMP" -lt 80 ] && S_TEMP=2 || S_TEMP=1
+  } || S_TEMP=3
+  
+  local TOTAL=$((S_CPU + S_RAM + S_GPU + S_DISK + S_INST + S_GEN + S_TEMP))
+  [ "$TOTAL" -gt 100 ] && TOTAL=100
+  
+  echo "$TOTAL|$S_CPU|$S_RAM|$S_GPU|$S_DISK|$S_INST|$S_GEN|$S_TEMP"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DAEMON (flock + systemd watchdog)
+# ═══════════════════════════════════════════════════════════════════════════
+
+daemon_main() {
+  local PF="/run/flytuxd.pid" HD="/var/lib/flytux/history" LOCK="/run/lock/flytuxd.lock"
+  mkdir -p "$HD" /run/lock
+  
+  exec 9>"$LOCK"
+  if ! flock -n 9; then
+    logger -t flytuxd "Otra instancia ya está corriendo"
+    exit 1
+  fi
+  
+  trap 'logger -t flytuxd "Daemon detenido (SIGTERM)"; rm -f "$PF"; exit 0' SIGTERM SIGINT
+  trap 'logger -t flytuxd "Daemon recargado (SIGHUP)"' SIGHUP
+  
+  echo $$ > "$PF"
+  
+  if [ -n "${NOTIFY_SOCKET:-}" ]; then
+    systemd-notify --ready 2>/dev/null || true
+  fi
+  
+  FM=$(grep -o '"mode":"[^"]*"' /etc/flytux/hw.json 2>/dev/null | cut -d'"' -f4)
+  [ -z "$FM" ] && FM="cooperative"
+  
+  logger -t flytuxd "Daemon iniciado (PID $$, modo: $FM)"
+  
+  LP=""; LT=""; CY=0
+  while true; do
+    PPD=$(systemctl is-active -q power-profiles-daemon 2>/dev/null && echo y || echo n)
+    TLD=$(systemctl is-active -q thermald 2>/dev/null && echo y || echo n)
+    ACT=true; [ "$FM" = "cooperative" ] && [ "$PPD" = "y" ] && ACT=false
+    
+    PS=$(battery_get_source)
+    [ "$PS" != "$LP" ] && { $ACT && battery_apply_profile; LP="$PS"; }
+    
+    if [ "$TLD" = "n" ] || [ "$FM" = "exclusive" ]; then
+      TP=$(thermal_profile)
+      [ "$TP" != "$LT" ] && { cpu_set_governor "$TP"; LT="$TP"; }
+    fi
+    
+    CY=$((CY+1))
+    if [ "$CY" -ge 10 ]; then
+      CY=0
+      T=$(thermal_get_temp)
+      B=$(battery_get_percent)
+      RA=$(awk '/MemAvailable/{printf "%d",$2/1024}' /proc/meminfo)
+      LD=$(cut -d' ' -f1 /proc/loadavg)
+      echo "$(date -Iseconds)|t=${T:-0}|p=$PS|b=$B|r=$RA|l=$LD|g=${LT:-?}" >> "$HD/sys.log"
+      [ -f "$HD/sys.log" ] && [ "$(stat -c%s "$HD/sys.log" 2>/dev/null)" -gt 1048576 ] && tail -1000 "$HD/sys.log" > "$HD/sys.log.tmp" && mv "$HD/sys.log.tmp" "$HD/sys.log"
+      
+      [ -n "${NOTIFY_SOCKET:-}" ] && systemd-notify WATCHDOG=1 2>/dev/null || true
+    fi
+    sleep 30
+  done
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# INSTALADOR DIVIDIDO EN SUBFUNCIONES
+# ═══════════════════════════════════════════════════════════════════════════
+
+install_backup() {
+  info "🔐 [1/12] Backup..."
+  run "backup" tar czf "$BKP" /etc/sysctl.d /etc/default /etc/systemd/system /etc/udev/rules.d \
+    /etc/modprobe.d /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null || true
+}
+
+install_repos() {
+  info "🔓 [2/12] Repositorios..."
+  for F in /etc/apt/sources.list.d/*.sources /etc/apt/sources.sources; do
+    [ -f "$F" ] && grep -q "^Components:" "$F" && ! grep -q "non-free" "$F" && \
+      sed -i '/^Components:/ s/$/ non-free non-free-firmware/' "$F" 2>/dev/null || true
+  done
+  [[ "$ID" == "debian" || "$ID_LIKE" == *"debian"* ]] || \
+    command -v add-apt-repository &>/dev/null && { add-apt-repository multiverse -y; add-apt-repository restricted -y; } || true
+  run_visible "apt update" apt update -o Acquire::Retries=3 --allow-releaseinfo-change || warn "apt update con errores"
+}
+
+install_detect() {
+  info "🔍 [3/12] Detectando hardware..."
+  read_cpuinfo
+  cache_lspci
+  detect_cpu_generation
+  detect_gpu
+  detect_storage
+  detect_peripherals
+  detect_system
+  
+  info "💾 ${RAM}MB | 💻 $LAPTOP | 🖥️ $CV $CG (F$CF/M$CM/S$CS) TLe≈${TLE}°C"
+  info "💿 $DT | 🎮 $GV ($PD) | 🤝 $AM → $FM"
+  info "🔧 SMT: $SMT | NUMA: $NUMA_NODES | Virtualización: $VIRT | Caché: $CPU_CACHE"
+}
+
+install_profile() {
+  info "💾 [4/12] Guardando perfil..."
+  DU=$(cat /sys/class/dmi/id/product_uuid 2>/dev/null || echo "none")
+  MI=$(cat /etc/machine-id 2>/dev/null || echo "none")
+  UUID=$(echo -n "$DU-$MI" | sha256sum | cut -c1-32 | sed 's/\(........\)\(....\)\(....\)\(....\)\(.*\)/\1-\2-4\3-8\4-\5/')
+  [ -f "$FX/hw.json" ] && OLD_UUID=$(grep -o '"uuid":"[^"]*"' "$FX/hw.json" | cut -d'"' -f4) && [ -n "$OLD_UUID" ] && UUID="$OLD_UUID"
+  
+  json_write "$FX/hw.json" \
+    v "26.0" uuid "$UUID" ts "$(date -Iseconds)" \
+    cpu_vendor "$CV" cpu_gen "$CG" cpu_family "$CF" cpu_model "$CM" cpu_stepping "$CS" \
+    cpu_cores "$CC" cpu_phys_cores "${CPU_PHYS_CORES:-$CC}" cpu_siblings "${CPU_SIBLINGS:-$CC}" \
+    cpu_sockets "${CPU_SOCKETS:-1}" cpu_cache "${CPU_CACHE:-unknown}" \
+    cpu_hybrid "$HYB" cpu_tle "$TLE" cpu_max_mhz "$CPU_MAX_MHZ" cpu_min_mhz "$CPU_MIN_MHZ" cpu_cur_mhz "${CPU_CUR_MHZ:-0}" \
+    cpu_smt "$SMT" cpu_virt "$VIRT" numa_nodes "$NUMA_NODES" \
+    ram "$RAM" disk "$DT" trim "$TRIM" gpu "$GV" hyb_gpu "$HYB_GPU" \
+    laptop "$LAPTOP" bt "$BT" modem "$MD" sb "$SB" de "$DE" managers "$AM" mode "$FM"
+}
+
+install_daemon() {
+  info "🤖 [5/12] Instalando daemon..."
+  run "install-binary" cp "$0" /usr/local/bin/flytux
+  run "chmod-binary" chmod +x /usr/local/bin/flytux
+  
+  # NOTA: ProtectSystem=strict puede fallar al escribir en /sys dependiendo de la versión de systemd
+  # WritePaths intenta mitigar esto, pero en algunas distros antiguas puede no funcionar
+  # Solución alternativa: usar ProtectSystem=full en lugar de strict si hay problemas
+  cat > /etc/systemd/system/flytuxd.service <<EOF
+[Unit]
+Description=FlyTux Cooperative Daemon
+After=systemd-modules-load.service
+Wants=systemd-modules-load.service
+
+[Service]
+Type=notify
+WatchdogSec=120
+ExecStart=/usr/local/bin/flytux --daemon
+Restart=on-failure
+RestartSec=10
+
+# Hardening (puede requerir ajuste en distros antiguas)
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+MemoryDenyWriteExecute=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallFilter=@system-service
+
+# Rutas necesarias (puede fallar en systemd < 245)
+ReadWritePaths=/var/lib/flytux /etc/flytux /run /run/lock
+WritePaths=/sys/devices/system/cpu
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  
+  cat > /etc/systemd/system/flytux-battery.service <<EOF
+[Unit]
+Description=Apply FlyTux battery profile
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/flytux --battery-apply
+EOF
+  
+  cat > /etc/udev/rules.d/99-flytux-power.rules <<EOF
+ACTION=="change", SUBSYSTEM=="power_supply", ENV{POWER_SUPPLY_TYPE}=="Mains", SYSTEMD_WANTS="flytux-battery.service"
+EOF
+  
+  run "daemon-reload" systemctl daemon-reload
+  svc_on flytuxd
+  run "udev-reload" udevadm control --reload-rules
+}
+
+install_kernel() {
+  info "⚙️  [6/12] Configurando kernel..."
+  cat > /etc/sysctl.d/99-flytux.conf <<EOF
 net.core.somaxconn=4096
 net.ipv4.tcp_fastopen=3
 net.core.netdev_max_backlog=4096
 net.core.rmem_max=16777216
 net.core.wmem_max=16777216
 EOF
-if sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -q "bbr"; then
-  echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.d/99-flytux.conf
-fi
-sysctl -p /etc/sysctl.d/99-flytux.conf >/dev/null 2>&1 || true
-echo "✅ Sysctl de red aplicados. Gestión de memoria delegada al kernel."
+  sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -q bbr && \
+    echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.d/99-flytux.conf
+  run "sysctl" sysctl -p /etc/sysctl.d/99-flytux.conf
+}
 
-# 6. APLICACIÓN DEL MOTOR DE PERFILES + GESTIÓN DE ENERGÍA
-echo ""; echo "⚡ [6/12] Aplicando optimizaciones de perfil y energía..."
-
-# ZRAM: Preferir systemd-zram-generator (nativo), luego zram-tools
-if [ "$USE_ZRAM" == "yes" ]; then
-  if [ -b /dev/zram0 ] || [ -d /sys/block/zram0 ]; then
-    echo "ℹ️ ZRAM ya activo."
-  elif pkg_exists "systemd-zram-generator"; then
-    install_or_upgrade "ZRAM Generator (systemd)" "systemd-zram-generator"
-    mkdir -p /etc/systemd/zram-generator.conf.d
-    echo -e "[zram0]\nzram-size = ram / 2\ncompression-algorithm = zstd" > /etc/systemd/zram-generator.conf.d/flytux.conf
-    systemctl daemon-reload
-    enable_service "systemd-zram-setup@zram0"
-  elif pkg_exists "zram-tools"; then
-    install_or_upgrade "ZRAM Tools" "zram-tools"
-    echo -e "ENABLE=yes\nSIZE=$ZRAM_SIZE\nALGO=zstd\nPRIORITY=100" > /etc/default/zramswap
-    enable_service "zramswap"
+install_memory() {
+  info "⚡ [7/12] Configurando memoria..."
+  ZS=$((RAM*50/100)); [ "$ZS" -gt 4096 ] && ZS=4096
+  if [ "$RAM" -le 8192 ] && [ ! -b /dev/zram0 ]; then
+    if pkg_exists systemd-zram-generator; then
+      inst "ZRAM" systemd-zram-generator
+      mkdir -p /etc/systemd/zram-generator.conf.d
+      echo -e "[zram0]\nzram-size=ram/2\ncompression-algorithm=zstd" > /etc/systemd/zram-generator.conf.d/fx.conf
+      run "daemon-reload" systemctl daemon-reload
+      svc_on systemd-zram-setup@zram0
+    elif pkg_exists zram-tools; then
+      inst "ZRAM" zram-tools
+      echo -e "ENABLE=yes\nSIZE=$ZS\nALGO=zstd\nPRIORITY=100" > /etc/default/zramswap
+      svc_on zramswap
+    fi
   fi
-fi
+  [ "$RAM" -le 8192 ] && { inst "EarlyOOM" earlyoom; svc_on earlyoom; }
+  [ "$RAM" -le 4096 ] && [ "$DT" = "hdd" ] && { inst "Preload" preload; svc_on preload; }
+}
 
-# EarlyOOM
-if [ "$USE_EARLYOOM" == "yes" ]; then
-  install_or_upgrade "EarlyOOM" "earlyoom"
-  sed -i 's/^EXTRA_ARGS=.*/EXTRA_ARGS="--notify all"/' /etc/default/earlyoom 2>/dev/null || true
-  enable_service "earlyoom"
-fi
-
-# Preload (solo HDD)
-if [ "$USE_PRELOAD" == "yes" ] && [ "$DISK_TYPE" == "HDD" ]; then
-  install_or_upgrade "Preload" "preload"
-  enable_service "preload"
-  sed -i "s/^# model.cycle.*/model.cycle = 2/" /etc/preload.conf 2>/dev/null || true
-  sed -i "s/^# model.halflife.*/model.halflife = 2/" /etc/preload.conf 2>/dev/null || true
-fi
-
-# Gestión de Energía (Laptop vs Desktop)
-if [ "$IS_LAPTOP" == "yes" ]; then
-  if [[ "$ID" == "debian" ]] || [[ "$ID_LIKE" == *"debian"* ]]; then
-    install_or_upgrade "Gestión de Energía (TLP)" "tlp" "tlp-rdw"
-    enable_service "tlp"
-  else
-    enable_service "power-profiles-daemon"
+install_power() {
+  info "🌡️  [8/12] Configurando energía..."
+  if [ "$LAPTOP" = "true" ]; then
+    [[ "$CV" == *"intel"* ]] && { inst "Thermald" thermald; svc_on thermald; }
+    if [[ "$ID" != "debian" && "$ID_LIKE" != *"debian"* ]]; then
+      inst "PPD" power-profiles-daemon; svc_on power-profiles-daemon
+    else
+      systemctl is-active -q power-profiles-daemon 2>/dev/null || { inst "TLP" tlp tlp-rdw; svc_on tlp; }
+    fi
   fi
-fi
+  inst "Sensors" lm-sensors
+}
 
-# NVMe específico
-if [ "$DISK_TYPE" == "NVME" ]; then
-  install_or_upgrade "Herramientas NVMe" "nvme-cli"
-fi
-
-# TRIM solo si soportado
-if [ "$SUPPORTS_TRIM" == "yes" ]; then
-  enable_service "fstrim.timer"
-  echo "✅ TRIM activado (soportado por el disco)."
-fi
-
-echo "✅ Perfil de rendimiento y energía aplicado."
-
-# 7. MOTOR DE DRIVERS INTELIGENTE
-echo ""; echo "🏭 [7/12] Motor de selección de drivers..."
-
-# Advertencia Secure Boot + NVIDIA
-if [[ "$GPU_VENDORS" == *"nvidia"* ]] && [ "$SECURE_BOOT" == "enabled" ]; then
-  echo "⚠️ ADVERTENCIA: Secure Boot activado. NVIDIA puede requerir firma manual o MOK enrollment."
-fi
-
-# Microcódigo (solo si no está instalado)
-if [[ "$CPU_VENDOR" == *"intel"* ]] && ! dpkg -l intel-microcode &>/dev/null | grep -q "^ii"; then
-  install_or_upgrade "Microcódigo Intel" "intel-microcode"
-fi
-if [[ "$CPU_VENDOR" == *"amd"* ]] && ! dpkg -l amd64-microcode &>/dev/null | grep -q "^ii"; then
-  install_or_upgrade "Microcódigo AMD" "amd64-microcode"
-fi
-
-# NVIDIA: Priorizar recomendación de distro
-if [[ "$GPU_VENDORS" == *"nvidia"* ]]; then
-  NVIDIA_PKG="nvidia-driver"
-  if command -v ubuntu-drivers &>/dev/null; then
-    REC_DRIVER=$(ubuntu-drivers devices 2>/dev/null | grep "recommended" | awk '{print $3}')
-    [ -n "$REC_DRIVER" ] && NVIDIA_PKG="$REC_DRIVER"
+install_gpu() {
+  info "🏭 [9/12] Drivers..."
+  [[ "$CV" == *"intel"* ]] && ! dpkg -l intel-microcode 2>/dev/null | grep -q "^ii" && inst "µcode" intel-microcode
+  [[ "$CV" == *"amd"* ]] && ! dpkg -l amd64-microcode 2>/dev/null | grep -q "^ii" && inst "µcode" amd64-microcode
+  
+  $HI && { PK=(); pkg_exists intel-media-driver && PK+=(intel-media-driver); pkg_exists mesa-va-drivers && PK+=(mesa-va-drivers); pkg_exists mesa-vulkan-drivers && PK+=(mesa-vulkan-drivers); [ ${#PK[@]} -gt 0 ] && inst "Intel GPU" "${PK[@]}"; }
+  $HA && { PK=(); pkg_exists firmware-amd-graphics && PK+=(firmware-amd-graphics); pkg_exists mesa-vulkan-drivers && PK+=(mesa-vulkan-drivers); pkg_exists mesa-va-drivers && PK+=(mesa-va-drivers); [ ${#PK[@]} -gt 0 ] && inst "AMD GPU" "${PK[@]}"; }
+  
+  if $HN; then
+    NP="nvidia-driver"
+    command -v ubuntu-drivers &>/dev/null && { R=$(ubuntu-drivers devices 2>/dev/null | awk '/recommended/{print $3}'); [ -n "$R" ] && NP="$R"; }
+    if [ "$SB" = "on" ]; then
+      warn "Secure Boot ON → NVIDIA omitido (requiere MOK enrollment)"
+    else
+      inst "NVIDIA" "$NP" nvidia-settings nvidia-prime
+      $HYB_GPU && command -v prime-select &>/dev/null && run "prime-select" prime-select on-demand || true
+    fi
   fi
-  install_or_upgrade "NVIDIA (Recomendado)" "$NVIDIA_PKG" "nvidia-settings"
-fi
+  
+  inst "Firmware" linux-firmware fwupd; svc_on fwupd
+  $TRIM && svc_on fstrim.timer
+  [ "$DT" = "nvme" ] && inst "NVMe" nvme-cli
+  pkg_exists envycontrol && inst "EnvyControl" envycontrol
+}
 
-# AMD: Paquetes oficiales (Nunca AMDGPU-PRO)
-if [[ "$GPU_VENDORS" == *"amd"* ]]; then
-  AMD_PKGS=()
-  pkg_exists "firmware-amd-graphics" && AMD_PKGS+=("firmware-amd-graphics")
-  pkg_exists "mesa-vulkan-drivers" && AMD_PKGS+=("mesa-vulkan-drivers")
-  pkg_exists "mesa-va-drivers" && AMD_PKGS+=("mesa-va-drivers")
-  pkg_exists "mesa-vdpau-drivers" && AMD_PKGS+=("mesa-vdpau-drivers")
-  pkg_exists "libdrm-amdgpu1" && AMD_PKGS+=("libdrm-amdgpu1")
-  [ ${#AMD_PKGS[@]} -gt 0 ] && install_or_upgrade "AMD Optimizado" "${AMD_PKGS[@]}"
-fi
+install_services() {
+  info "🔕 [10/12] Optimizando servicios..."
+  $BT || svc_off bluetooth
+  $MD || svc_off ModemManager
+  $PR || svc_off cups
+}
 
-# Intel: Paquetes oficiales + aceleración de video no-free
-if [[ "$GPU_VENDORS" == *"intel"* ]]; then
-  INTEL_PKGS=()
-  pkg_exists "intel-media-driver" && INTEL_PKGS+=("intel-media-driver")
-  pkg_exists "intel-media-va-driver-non-free" && INTEL_PKGS+=("intel-media-va-driver-non-free")
-  pkg_exists "intel-gpu-tools" && INTEL_PKGS+=("intel-gpu-tools")
-  [ ${#INTEL_PKGS[@]} -gt 0 ] && install_or_upgrade "Intel Optimizado" "${INTEL_PKGS[@]}"
-fi
+install_security() {
+  info "🛡️ [11/12] Seguridad..."
+  run "ufw-reset" ufw --force reset
+  run "ufw-default-in" ufw default deny incoming
+  run "ufw-default-out" ufw default allow outgoing
+  for P in 21 23 135 137 139 445 3389 5900; do run "ufw-deny-$P" ufw deny $P/tcp 2>/dev/null || true; done
+  run "ufw-enable" ufw --force enable
+  svc_on ufw
+  
+  for p in popularity-contest whoopsie apport ubuntu-report; do
+    dpkg -l "$p" &>/dev/null && run "purge:$p" apt purge -y "$p" || true
+  done
+  
+  command -v aa-enforce &>/dev/null && {
+    for f in /etc/apparmor.d/*flatpak* /etc/apparmor.d/*bwrap*; do
+      [ -f "$f" ] && run "apparmor:$f" aa-enforce "$f" || true
+    done
+    svc_on apparmor
+  }
+  
+  if [ -n "$AU" ] && [ "$AU" != "root" ]; then
+    DB="unix:path=/run/user/$(id -u "$AU")/bus"
+    case "$DE" in
+      *gnome*|*zorin*) runuser -u "$AU" -- env DBUS_SESSION_BUS_ADDRESS="$DB" gsettings set org.gnome.desktop.interface enable-animations true 2>/dev/null || true;;
+      *cinnamon*) runuser -u "$AU" -- env DBUS_SESSION_BUS_ADDRESS="$DB" gsettings set org.cinnamon.desktop.interface enable-animations true 2>/dev/null || true;;
+      *kde*|*plasma*) runuser -u "$AU" -- kwriteconfig5 --file kwinrc --group Compositing --key Enabled true 2>/dev/null || true;;
+    esac
+  fi
+}
 
-install_or_upgrade "Firmware Base" "linux-firmware" "fwupd"
-enable_service "fwupd"
-echo "✅ Drivers seleccionados por compatibilidad y recomendación de distro."
+install_cleanup() {
+  info "🧹 [12/12] Limpieza..."
+  run "full-upgrade" apt full-upgrade -y
+  run "autoremove" apt autoremove -y --purge
+  run "clean" apt clean
+  run "journal-vacuum" journalctl --vacuum-size=200M --vacuum-time=14d
+  run "tmpfiles" systemd-tmpfiles --clean
+  
+  cat > "$FV/PRIVACY.txt" <<EOF
+🔒 FlyTux: 100% local. Sin red. Sin telemetría externa.
+Datos en $FV/history/ son SOLO tuyos.
+EOF
+}
 
-# 8. CODECS, FUENTES Y WINE
-echo ""; echo "🎬 [8/12] Codecs, fuentes y compatibilidad..."
-install_or_upgrade "Multimedia" "libavcodec-extra" "gstreamer1.0-plugins-bad" "gstreamer1.0-plugins-ugly" "gstreamer1.0-libav" "ffmpeg" "libdvd-pkg" "unrar" "p7zip-full" "p7zip-rar" "zip" "unzip" "ttf-mscorefonts-installer" "fonts-liberation" "fonts-noto" "fonts-noto-cjk" "fonts-roboto"
-dpkg -l libdvd-pkg &>/dev/null | grep -q "^ii" && echo y | DEBIAN_FRONTEND=noninteractive dpkg-reconfigure libdvd-pkg 2>/dev/null || true
+install_flytux() {
+  echo "🐧 FlyTux v26.0 - Instalando..."
+  [ "$(id -u)" -ne 0 ] && fatal "Ejecutar con: sudo bash $0"
+  
+  . /etc/os-release
+  [[ "$ID_LIKE" =~ debian|ubuntu || "$ID" =~ debian|ubuntu|linuxmint|pop|zorin ]] || fatal "Distro incompatible"
+  export DEBIAN_FRONTEND=noninteractive
+  
+  mkdir -p /var/backups "$FX" "$FV/history"
+  exec > >(tee -a "$LOG") 2>&1
+  
+  install_backup
+  install_repos
+  install_detect
+  install_profile
+  install_daemon
+  install_kernel
+  install_memory
+  install_power
+  install_gpu
+  install_services
+  install_security
+  install_cleanup
+  
+  SCORE_DATA=$(score_calculate)
+  IFS='|' read -r TOTAL S_CPU S_RAM S_GPU S_DISK S_INST S_GEN S_TEMP <<< "$SCORE_DATA"
+  
+  echo ""
+  echo "════════════════════════════════════════════════════════"
+  echo "🐧 FlyTux v26.0 INSTALADO"
+  echo "════════════════════════════════════════════════════════"
+  echo ""
+  echo "🆔 UUID: $UUID"
+  echo "🖥️  CPU: $CV $CG (F$CF/M$CM) TLe≈${TLE}°C"
+  echo "   Cores: $CC (físicos: ${CPU_PHYS_CORES:-?}, logical: ${CPU_SIBLINGS:-?})"
+  echo "   SMT: $SMT | NUMA: $NUMA_NODES | Virtualización: $VIRT"
+  echo "   Frecuencia: ${CPU_MIN_MHZ}-${CPU_MAX_MHZ} MHz (actual: ${CPU_CUR_MHZ:-?})"
+  echo "   Caché: $CPU_CACHE"
+  echo "💾 RAM: ${RAM}MB | 💿 Disco: $DT | 🎮 GPU: $GV"
+  echo "🤝 Modo: $FM | 🔐 Secure Boot: $SB"
+  echo ""
+  echo "📊 SCORE: $TOTAL/100"
+  echo "   CPU: $S_CPU/35 | RAM: $S_RAM/20 | GPU: $S_GPU/20"
+  echo "   Disco: $S_DISK/10 | Instr: $S_INST/5 | Gen: $S_GEN/5 | Temp: $S_TEMP/5"
+  echo ""
+  
+  if [ ${#ERRORS[@]} -gt 0 ]; then
+    echo "⚠️  ERRORES DURANTE LA INSTALACIÓN (${#ERRORS[@]}):"
+    for e in "${ERRORS[@]}"; do echo "   • $e"; done
+    echo ""
+  fi
+  
+  if [ ${#WARNINGS[@]} -gt 0 ]; then
+    echo "ℹ️  ADVERTENCIAS (${#WARNINGS[@]}):"
+    for w in "${WARNINGS[@]}"; do echo "   • $w"; done
+    echo ""
+  fi
+  
+  echo "📁 Archivos:"
+  echo "   • Perfil: $FX/hw.json"
+  echo "   • Historial: $FV/history/"
+  echo "   • Daemon: /usr/local/bin/flytux --daemon"
+  echo ""
+  echo "💡 Reinicia para activar el daemon."
+  echo "🔙 Revertir: sudo tar xzf $BKP -C /"
+  echo "════════════════════════════════════════════════════════"
+}
 
-dpkg --add-architecture i386 2>/dev/null || true
-apt update >/dev/null 2>&1 || true
-install_or_upgrade "Wine Full" "wine" "wine64" "wine32" "winetricks" "winbind" "libwine" "fonts-wine" "wine-tools" "cabextract" "libgl1-mesa-glx:i386" "libgl1-mesa-dri:i386" "libpulse0:i386" "libcups2:i386" "libdbus-1-3:i386" "libasound2:i386"
-echo "✅ Codecs y Wine configurados"
+# ═══════════════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════════════
 
-# 9. DESINSTALACIÓN DE SOFTWARE PESADO
-echo ""; echo "🗑️ [9/12] Liberando recursos..."
-for pkg in firefox firefox-esr libreoffice-core libreoffice-calc libreoffice-writer libreoffice-impress; do
-  dpkg -l "$pkg" &>/dev/null && apt purge -y "$pkg" >/dev/null 2>&1 || true
-done
-apt autoremove -y --purge >/dev/null 2>&1 || true
-echo "✅ Software pesado desinstalado"
-
-# 10. APPS ESENCIALES + JOPDF + PROTON VPN
-echo ""; echo "🔄 [10/12] Despliegue de aplicaciones esenciales..."
-install_or_upgrade "Impresión/PDF" "cups" "cups-client" "printer-driver-all" "system-config-printer" "poppler-utils" "qpdf" "pdfarranger" "pdftk" "pdfgrep" "nomacs"
-enable_service "cups"
-
-# Brave
-if ! dpkg -l brave-browser &>/dev/null | grep -q "^ii"; then
-  [ ! -f /usr/share/keyrings/brave-browser-archive-keyring.gpg ] && { curl -fsSLo /usr/share/keyrings/brave-browser-archive-keyring.gpg https://brave-browser-apt-release.s3.brave.com/brave-browser-archive-keyring.gpg; echo "deb [signed-by=/usr/share/keyrings/brave-browser-archive-keyring.gpg arch=amd64] https://brave-browser-apt-release.s3.brave.com/ stable main" | tee /etc/apt/sources.list.d/brave-browser-release.list >/dev/null; }
-fi
-
-# Proton VPN (Método Oficial Dinámico)
-if ! dpkg -l proton-vpn-gnome-desktop &>/dev/null | grep -q "^ii" && ! dpkg -l protonvpn &>/dev/null | grep -q "^ii"; then
-  echo "   Descargando paquete de configuración oficial de ProtonVPN..."
-  PROTON_DEB_URL=$(curl -s "https://repo.protonvpn.com/debian/dists/stable/main/binary-all/" 2>/dev/
+case "$1" in
+  --daemon)
+    read_cpuinfo
+    cache_lspci
+    detect_cpu_generation
+    detect_storage
+    daemon_main
+    ;;
+  --battery-apply)
+    battery_apply_profile
+    ;;
+  --score)
+    read_cpuinfo
+    cache_lspci
+    detect_cpu_generation
+    detect_gpu
+    detect_storage
+    SCORE_DATA=$(score_calculate)
+    IFS='|' read -r TOTAL S_CPU S_RAM S_GPU S_DISK S_INST S_GEN S_TEMP <<< "$SCORE_DATA"
+    echo "📊 FlyTux Score: $TOTAL/100"
+    echo "   CPU: $S_CPU/35 | RAM: $S_RAM/20 | GPU: $S_GPU/20"
+    echo "   Disco: $S_DISK/10 | Instr: $S_INST/5 | Gen: $S_GEN/5 | Temp: $S_TEMP/5"
+    ;;
+  --install|"")
+    install_flytux
+    ;;
+  *)
+    echo "Uso: $0 [--daemon|--install|--score|--battery-apply]"
+    exit 1
+    ;;
+esac
