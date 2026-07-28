@@ -1,55 +1,53 @@
-# 🐧 FlyTux Optimizer v15.1
-### *Edición "Fuentes Estables + Detección Robusta"*
+# 🐧 FlyTux Optimizer v26.0
+### *Sistema Cognitivo Cooperativo (Refined Edition)*
 
 ![Linux](https://img.shields.io/badge/OS-Debian_%7C_Ubuntu_%7C_Mint-FCC624?logo=linux&logoColor=black)
-![Version](https://img.shields.io/badge/Version-15.1-blue)
+![Version](https://img.shields.io/badge/Version-26.0_Refined-blue)
 ![Shell](https://img.shields.io/badge/Shell-Bash_5.0+-4EAA25?logo=gnubash)
 ![License](https://img.shields.io/github/license/gridacorp/Flytux-Linux-Optimizer)
 
-> Script de optimización adaptativa profesional para sistemas basados en Debian/Ubuntu. Utiliza detección de hardware de nivel superior (`/sys`, `/proc`, `dmidecode`, tablas de modelos) para aplicar ajustes seguros, estables y personalizados a tu sistema.
+> Sistema de optimización adaptativa de nueva generación. Utiliza telemetría de hardware en tiempo real, puntuación ponderada y un daemon cognitivo para ajustar dinámicamente el rendimiento, la energía y la seguridad de tu sistema Linux.
 
 ---
 
 ## ⚠️ Advertencias Críticas (Leer antes de ejecutar)
 
 > [!CAUTION]
-> - **Requiere `sudo`**: Este script modifica archivos del sistema. Debe ejecutarse como root.
-> - **Desinstalación de Software**: Por defecto, el script **elimina Firefox y LibreOffice** para liberar recursos. Si deseas conservarlos, edita la sección `[9/12]` del script antes de ejecutarlo.
-> - **Reinicio Obligatorio**: Los cambios de kernel, microcódigo, drivers y ZRAM requieren un reinicio para surtir efecto.
-> - **Solo Debian/Ubuntu**: El script se detendrá automáticamente si detecta Arch, Fedora u otras distribuciones no compatibles.
+> - **Requiere `sudo`**: Modifica configuraciones a nivel de kernel, systemd y red.
+> - **NVIDIA + Secure Boot**: Si Secure Boot está activo, la instalación de drivers NVIDIA se omitirá automáticamente (requiere enrollamiento manual de claves MOK).
+> - **Telemetría**: El script elimina paquetes de telemetría de Ubuntu/Debian (`popularity-contest`, `whoopsie`, `apport`).
+> - **Solo Debian/Ubuntu**: Compatible nativamente con Debian 11/12, Ubuntu 20.04-24.04, Linux Mint, Pop!_OS y Zorin OS.
 
 ---
 
-## ✨ Características Principales
+## ✨ Características Principales (Novedades v26.0)
 
-### 🔍 1. Detección de Hardware Robusta y Precisa
-A diferencia de otros optimizadores, FlyTux no adivina. Consulta fuentes directas del kernel y tablas oficiales:
-- **CPU**: Detección de vendor, generación exacta (Intel 12th-14th Gen, AMD Zen 2-5), instrucciones (AVX2/AVX512) y topología híbrida (P-Cores / E-Cores).
-- **Almacenamiento**: Identifica HDD, SSD SATA o NVMe, y verifica el soporte real de TRIM vía `lsblk --discard`.
-- **GPU**: Detección multinivel (`glxinfo` → `vulkaninfo` → DRM → `lspci`) para identificar el controlador primario en uso.
-- **Otros**: RAM ECC, modo de arranque (BIOS/UEFI), estado de Secure Boot y factor de forma (Laptop/Desktop).
+### 🔍 1. Detección de Hardware de Precisión (Sin conjeturas)
+- **CPU**: Lectura optimizada de `/proc/cpuinfo` y `lscpu -J`. Detecta generación exacta (Intel Core Ultra, AMD Zen 4/5), topología híbrida (P/E-Cores), SMT, NUMA, cachés y virtualización (VMX/SVM).
+- **GPU**: Identificación por **Device ID** real (tabla ampliada con RTX 50xx/40xx, RX 7000, Intel Arc) para una puntuación precisa.
+- **Almacenamiento**: Detección de NVMe/SSD/HDD y validación real de soporte TRIM vía `lsblk --discard`.
 
-### 📊 2. Motor de Perfiles Adaptativos
-El script no aplica una receta única. Calcula un perfil basado en tu RAM y tipo de disco:
+### 📊 2. FlyTux Score™ (Sistema de Puntuación Ponderado)
+Evalúa tu hardware en una escala de **0 a 100 puntos** basada en 7 factores:
+- **CPU** (hasta 35 pts): Núcleos, frecuencia máxima y topología híbrida.
+- **RAM** (hasta 20 pts): Cantidad total de memoria.
+- **GPU** (hasta 20 pts): Basado en Device ID específico (ej. RTX 4090 = 18 pts).
+- **Disco** (10 pts), **Instrucciones** (5 pts), **Generación** (5 pts) y **Temperatura** (5 pts).
 
-| Nivel de RAM | Tipo de Disco | Acciones Automáticas |
-| :--- | :--- | :--- |
-| **≤ 4GB (Low)** | HDD | ZRAM (50%), EarlyOOM, Preload (agresivo) |
-| **≤ 4GB (Low)** | SSD/NVMe | ZRAM (50%), EarlyOOM |
-| **≤ 8GB (Mid)** | HDD | ZRAM, EarlyOOM, Preload |
-| **≤ 8GB (Mid)** | SSD/NVMe | ZRAM, EarlyOOM (si no hay Swap) |
-| **> 8GB (High+)** | Cualquiera | EarlyOOM (solo si no hay Swap). Gestión de memoria delegada al kernel. |
+### 🧠 3. Daemon Cognitivo Cooperativo (`flytuxd`)
+Un servicio en segundo plano que monitorea el sistema cada 30 segundos:
+- **Modo Cooperativo**: Respeta gestores de energía existentes (Power Profiles Daemon, TLP) y solo actúa si es necesario.
+- **Ajuste Dinámico**: Cambia automáticamente el `governor` de la CPU y el modo de la GPU (Integrated/On-Demand/NVIDIA) según si estás conectado a la corriente o con batería, y según la temperatura térmica en tiempo real.
 
-### 🛡️ 3. Seguridad y Estabilidad Primero
-- **Backup Automático**: Crea un archivo `.tar.gz` de `/etc` (sysctl, systemd, apt, modprobe) en `/var/backups/` antes de cualquier cambio.
-- **Sysctl No Intrusivo**: Solo optimiza la red (TCP BBR, Fast Open, buffers). **No** toca parámetros de memoria del kernel, evitando inestabilidad.
-- **Validación de Servicios**: Solo habilita servicios (`systemctl enable`) si el archivo `.service` existe físicamente en el sistema.
+### 🛡️ 4. Hardening y Seguridad Documentada
+- **Systemd Hardening**: `ProtectSystem=strict`, `NoNewPrivileges=yes`, `MemoryDenyWriteExecute=yes` (con rutas de escritura explícitas documentadas para evitar fallos en distros antiguas).
+- **Red**: UFW configurado con política *Deny Incoming / Allow Outgoing* y puertos vulnerables (135, 139, 445, 3389) bloqueados.
+- **AppArmor**: Refuerzo de perfiles de Flatpak y Bubblewrap si están presentes.
 
-### 🏭 4. Motor de Drivers Inteligente
-- Instala el **microcódigo** correcto (Intel/AMD) si falta.
-- **NVIDIA**: Usa `ubuntu-drivers` para instalar la versión *recomendada*, no la más reciente (evita roturas).
-- **AMD**: Instala el stack open-source completo (Mesa, Vulkan, VA-API, VDPAU). *Nunca instala AMDGPU-PRO*.
-- **Intel**: Instala los drivers de media no-libres para aceleración de video por hardware.
+### ⚡ 5. Instalación Modular y Optimizada
+- Código refactorizado en **8 subfunciones** independientes de ~100 líneas.
+- Consultas al sistema optimizadas con `awk` único (eliminando cadenas ineficientes de `grep | awk | cat`).
+- Generación automática de un perfil de hardware en formato JSON (`/etc/flytux/hw.json`).
 
 ---
 
@@ -59,7 +57,7 @@ El script no aplica una receta única. Calcula un perfil basado en tu RAM y tipo
 git clone https://github.com/gridacorp/Flytux-Linux-Optimizer.git && \
 cd Flytux-Linux-Optimizer && \
 chmod +x "FlyTux Optimizer.sh" && \
-sudo "./FlyTux Optimizer.sh" && \
+sudo "./FlyTux Optimizer.sh" --install && \
 sudo reboot
 ```
 
@@ -67,25 +65,20 @@ sudo reboot
 
 ## 📋 Instalación Paso a Paso con Verificación
 
-Si prefieres tener control total sobre el proceso, sigue estos pasos:
-
 ```bash
 # ── Paso 1: Clonar repositorio ───────────────────────────────
 git clone https://github.com/gridacorp/Flytux-Linux-Optimizer.git
 cd Flytux-Linux-Optimizer
 
-# ── Paso 2: Verificar integridad del script (Recomendado) ────
-# Verificar que el script existe y tiene tamaño razonable (~30-50KB)
+# ── Paso 2: Verificar integridad del script ──────────────────
 ls -lh "FlyTux Optimizer.sh"
-
-# Verificar sintaxis bash sin ejecutar
 bash -n "FlyTux Optimizer.sh" && echo "✅ Sintaxis válida" || echo "❌ Error de sintaxis"
 
-# ── Paso 3: Ejecutar ─────────────────────────────────────────
+# ── Paso 3: Ejecutar instalación ─────────────────────────────
 chmod +x "FlyTux Optimizer.sh"
-sudo "./FlyTux Optimizer.sh"
+sudo "./FlyTux Optimizer.sh" --install
 
-# ── Paso 4: Reiniciar ────────────────────────────────────────
+# ── Paso 4: Reiniciar para activar el daemon y el kernel ─────
 sudo reboot
 ```
 
@@ -93,57 +86,65 @@ sudo reboot
 
 ## 🔍 Verificación Post-Instalación
 
-Una vez reiniciado, puedes verificar que todo se aplicó correctamente:
+Una vez reiniciado, verifica que el sistema cognitivo esté funcionando:
 
 ```bash
-# 1. Verificar que el script se ejecutó hasta el final
-grep "COMPLETADO" /var/log/flytux-*.log | tail -n 1
+# 1. Verificar el FlyTux Score de tu hardware
+flytux --score
 
-# 2. Verificar el perfil de hardware que se te aplicó
-grep "Perfil:" /var/log/flytux-*.log | tail -n 1
+# 2. Verificar que el daemon cognitivo está activo
+systemctl status flytuxd.service
 
-# 3. Verificar servicios y configuraciones clave
-systemctl is-enabled earlyoom.service      # Debería decir "enabled"
-systemctl is-enabled fstrim.timer          # Debería decir "enabled" (si es SSD/NVMe)
-wine --version 2>/dev/null || echo "ℹ️ Wine: verificar instalación"
-protonvpn status 2>/dev/null || echo "ℹ️ ProtonVPN: requiere login manual"
+# 3. Consultar el perfil de hardware detectado (JSON)
+cat /etc/flytux/hw.json | jq .  # (Instala 'jq' si quieres verlo formateado)
+
+# 4. Verificar que UFW está activo y configurado
+sudo ufw status verbose
+
+# 5. Verificar el historial de telemetría local
+tail -n 5 /var/lib/flytux/history/sys.log
 ```
 
 ---
 
-## 🔙 Cómo Revertir Cambios (Rollback)
+## 🔙 Cómo Revertir Cambios (Rollback Seguro)
 
-Si algo no funciona como esperas, el script crea un backup de tus archivos de configuración.
+El script crea un backup completo de las configuraciones críticas antes de tocar nada.
 
 ```bash
-# 1. Identificar y restaurar el backup automático
-ls -lh /var/backups/flytux-etc-*.tar.gz
-sudo tar xzf /var/backups/flytux-etc-YYYY-MM-DD.tar.gz -C /  # Reemplaza con la fecha real
+# 1. Identificar el archivo de backup más reciente
+ls -lh /var/backups/flytux-*.tar.gz
 
-# 2. Limpiar configuraciones específicas de FlyTux
+# 2. Restaurar las configuraciones de /etc (Reemplaza el nombre del archivo)
+sudo tar xzf /var/backups/flytux-YYYY-MM-DD.tar.gz -C /
+
+# 3. Limpiar servicios y configuraciones específicas de FlyTux
+sudo systemctl disable --now flytuxd.service
+sudo rm -f /etc/systemd/system/flytuxd.service /etc/systemd/system/flytux-battery.service
+sudo rm -f /etc/udev/rules.d/99-flytux-power.rules
 sudo rm -f /etc/sysctl.d/99-flytux.conf
-sudo rm -f /etc/modprobe.d/*flytux*.conf
-sudo rm -f /etc/default/earlyoom
+sudo rm -rf /etc/flytux /var/lib/flytux
 
-# 3. Desactivar servicios añadidos
-sudo systemctl disable earlyoom.service
-sudo systemctl disable preload.service
+# 4. Resetear firewall a estado predeterminado
+sudo ufw --force reset
 
-# 4. Restaurar GRUB (si se modificó) y reiniciar
-sudo update-grub && sudo reboot
+# 5. Recargar systemd y reiniciar
+sudo systemctl daemon-reload
+sudo udevadm control --reload-rules
+sudo reboot
 ```
 
 ---
 
 ## 🔄 Actualizar FlyTux Optimizer
 
-Si ya tienes el repositorio clonado y quieres aplicar las últimas mejoras:
+Para obtener las últimas mejoras en la detección de hardware o nuevos perfiles:
 
 ```bash
 cd ~/Flytux-Linux-Optimizer
 git pull origin main
 chmod +x "FlyTux Optimizer.sh"
-sudo "./FlyTux Optimizer.sh"
+sudo "./FlyTux Optimizer.sh" --install
 sudo reboot
 ```
 
@@ -153,42 +154,35 @@ sudo reboot
 
 ```text
 Flytux-Linux-Optimizer/
-├── FlyTux Optimizer.sh      # Script principal de optimización (v15.1)
-├── README.md                # Esta documentación completa
+├── FlyTux Optimizer.sh      # Script principal (v26.0 Refined Edition)
+├── README.md                # Esta documentación
 ├── LICENSE                  # Licencia MIT
-└── .github/                 # Configuración de GitHub (issues, workflows)
+└── .github/                 # Configuración de GitHub (Issues, Workflows)
 ```
 
 ---
 
 ## 🤝 Contribuir
 
-¡Las contribuciones son bienvenidas! Sigue estos pasos:
+El desarrollo de detectores de hardware y perfiles de energía es una tarea comunitaria.
 
 1. Haz un **Fork** del repositorio.
-2. Clona tu fork: `git clone https://github.com/TU_USUARIO/Flytux-Linux-Optimizer.git`
-3. Crea una rama para tu mejora: `git checkout -b feature/tu-mejora`
-4. Prueba el script en una **Máquina Virtual** (VirtualBox/KVM) antes de subir cambios.
-5. Haz commit y push: 
-   ```bash
-   git commit -m "feat: descripción clara de tu mejora"
-   git push origin feature/tu-mejora
-   ```
-6. Abre un **Pull Request** en GitHub describiendo los cambios.
+2. Crea una rama: `git checkout -b feature/nuevo-device-id-gpu`
+3. Prueba los cambios en una **Máquina Virtual** o hardware de prueba.
+4. Abre un **Pull Request** describiendo el hardware utilizado para las pruebas.
 
 ---
 
 ## 📄 Licencia
 
 ```text
-MIT License - FlyTux Optimizer v15.1
+MIT License - FlyTux Optimizer v26.0
 Copyright (c) 2026 Gridacorp Contributors
 
 Se concede permiso gratuito para usar, copiar, modificar, fusionar, publicar,
 distribuir, sublicenciar y/o vender copias del Software.
 
-EL SOFTWARE SE PROPORCIONA "TAL CUAL", SIN GARANTÍA DE NINGÚN TIPO. 
-El uso de este script es bajo tu propia responsabilidad.
+EL SOFTWARE SE PROPORCIONA "TAL CUAL", SIN GARANTÍA DE NINGÚN TIPO.
 ```
 
 ---
@@ -197,19 +191,19 @@ El uso de este script es bajo tu propia responsabilidad.
 
 [![Donar con PayPal](https://www.paypalobjects.com/es_ES/ES/i/btn/btn_donateCC_LG.gif)](https://www.paypal.com/donate/?hosted_button_id=DMREEX4NSS7V4)
 
-- 🐛 **Reporta bugs**: [Issues](https://github.com/gridacorp/Flytux-Linux-Optimizer/issues) *(Adjunta tu log de `/var/log/flytux-*.log`)*
+- 🐛 **Reporta bugs**: [Issues](https://github.com/gridacorp/Flytux-Linux-Optimizer/issues) *(Adjunta siempre tu `/var/log/flytux-*.log`)*
 - 💡 **Sugiere mejoras**: [Discussions](https://github.com/gridacorp/Flytux-Linux-Optimizer/discussions)
-- 📝 **Mejora la documentación**: Envía un Pull Request
 
 ---
 
 <div align="center">
 
-> 🐧 *"Haz que tu Linux vuele — seguro, compatible y sin límites."*  
-> **FlyTux Optimizer v15.1** — Hecho con ❤️ por Gridacorp para la comunidad Linux.
+> 🐧 *"Haz que tu Linux vuele — inteligente, adaptativo y sin límites."*  
+> **FlyTux Optimizer v26.0** — Hecho con ❤️ por Gridacorp para la comunidad Linux.
 
 [![GitHub Stars](https://img.shields.io/github/stars/gridacorp/Flytux-Linux-Optimizer?style=flat)](https://github.com/gridacorp/Flytux-Linux-Optimizer/stargazers)
 [![GitHub Forks](https://img.shields.io/github/forks/gridacorp/Flytux-Linux-Optimizer?style=flat)](https://github.com/gridacorp/Flytux-Linux-Optimizer/network/members)
 
 </div>
 ```
+te con las nuevas funciones del script.
